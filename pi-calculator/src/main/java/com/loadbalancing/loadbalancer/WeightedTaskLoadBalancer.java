@@ -34,6 +34,7 @@ public class WeightedTaskLoadBalancer extends AttachableDuplexInputChannelBase i
         private String channelId;
         private int weight;
         private int freeQuota;
+        private Object lockFreeQuota = new Object();
 
         private HashSet<TConnection> openConnections = new HashSet<TConnection>();
 
@@ -65,13 +66,17 @@ public class WeightedTaskLoadBalancer extends AttachableDuplexInputChannelBase i
         }
 
         public void decreaseFreeQuota() {
-            if (freeQuota > 0) {
-                this.freeQuota--;
+            synchronized (lockFreeQuota) {
+                if (freeQuota > 0) {
+                    this.freeQuota--;
+                }
             }
         }
 
         public void resetFreeQuota() {
-            freeQuota = weight;
+            synchronized (lockFreeQuota) {
+                freeQuota = weight;
+            }
         }
 
         public int getWeight() {
@@ -79,7 +84,9 @@ public class WeightedTaskLoadBalancer extends AttachableDuplexInputChannelBase i
         }
 
         public int getFreeQuota() {
-            return freeQuota;
+            synchronized (lockFreeQuota) {
+                return freeQuota;
+            }
         }
 
         public String getChannelId() {
@@ -147,27 +154,39 @@ public class WeightedTaskLoadBalancer extends AttachableDuplexInputChannelBase i
     public void removeAllDuplexOutputChannels() {
         EneterTrace trace = EneterTrace.entering();
         try {
+            List<TReceiver> copyOfReceivers = null;
             synchronized (receivers) {
                 synchronized (availableReceivers) {
-                    for (TReceiver receiver : receivers) {
-                        for (WeightedTaskLoadBalancer.TReceiver.TConnection connection : receiver
-                                .getOpenConnections()) {
-                            try {
-                                connection.getDuplexOutputChannel().closeConnection();
-                            } catch (Exception exception) {
-                                EneterTrace.error(TracedObject() + " failed to close connection to "
-                                        + receiver.getChannelId(), exception);
-                            }
-                            connection.getDuplexOutputChannel().responseMessageReceived()
-                                    .unsubscribe(this.onResponseMessageReceivedHandler);
-                        }
-                    }
+                    // The synchronized code is kept small, so that it shouldn't get affected by blocking
+                    // operations.
+                    // Because of this, the actual closing operation of the closing of the duplex output
+                    // channels takes place outside of the synchronized code.
+                    copyOfReceivers = new ArrayList<TReceiver>(receivers);
                     receivers.clear();
                     availableReceivers.clear();
                 }
             }
+
+            for (TReceiver receiver : copyOfReceivers) {
+                removeDuplexOutputChannels(receiver);
+            }
         } finally {
             EneterTrace.leaving(trace);
+        }
+    }
+
+    private void removeDuplexOutputChannels(TReceiver receiver) {
+
+        for (WeightedTaskLoadBalancer.TReceiver.TConnection connection : receiver.getOpenConnections()) {
+            try {
+                connection.getDuplexOutputChannel().closeConnection();
+            } catch (Exception exception) {
+                EneterTrace.error(
+                        TracedObject() + " failed to close connection to " + receiver.getChannelId(),
+                        exception);
+            }
+            connection.getDuplexOutputChannel().responseMessageReceived()
+                    .unsubscribe(this.onResponseMessageReceivedHandler);
         }
     }
 
@@ -175,35 +194,31 @@ public class WeightedTaskLoadBalancer extends AttachableDuplexInputChannelBase i
     public void removeDuplexOutputChannel(final String channelId) throws Exception {
         EneterTrace trace = EneterTrace.entering();
         try {
+
+            TReceiver receiver = null;
             synchronized (receivers) {
                 synchronized (availableReceivers) {
+                    // The synchronized code is kept small, so that it shouldn't get affected by blocking
+                    // operations.
+                    // Because of this, the actual closing operation of the closing of the duplex output
+                    // channels takes place outside of the synchronized code.
+                    receiver = EnumerableExt.firstOrDefault(receivers, new IFunction1<Boolean, TReceiver>() {
 
-                    TReceiver receiver =
-                            EnumerableExt.firstOrDefault(receivers, new IFunction1<Boolean, TReceiver>() {
-
-                                @Override
-                                public Boolean invoke(TReceiver aReceiver) throws Exception {
-                                    return Boolean.valueOf(aReceiver.getChannelId().equals(channelId));
-                                }
-
-                            });
-                    if (receiver != null) {
-                        for (WeightedTaskLoadBalancer.TReceiver.TConnection connection : receiver
-                                .getOpenConnections()) {
-                            try {
-                                connection.getDuplexOutputChannel().closeConnection();
-                            } catch (Exception exception) {
-                                EneterTrace.error(TracedObject() + " failed to close connection to "
-                                        + channelId, exception);
-                            }
-                            connection.getDuplexOutputChannel().responseMessageReceived()
-                                    .unsubscribe(this.onResponseMessageReceivedHandler);
+                        @Override
+                        public Boolean invoke(TReceiver aReceiver) throws Exception {
+                            return Boolean.valueOf(aReceiver.getChannelId().equals(channelId));
                         }
 
+                    });
+                    if (receiver != null) {
                         receivers.remove(receiver);
                         availableReceivers.remove(receiver);
                     }
                 }
+            }
+
+            if (receiver != null) {
+                removeDuplexOutputChannels(receiver);
             }
         } finally {
             EneterTrace.leaving(trace);
@@ -236,96 +251,95 @@ public class WeightedTaskLoadBalancer extends AttachableDuplexInputChannelBase i
                     EneterTrace
                             .warning(TracedObject()
                                     + " could not forward the request because there are no attached duplex output channels.");
-                } else {
-                    synchronized (availableReceivers) {
-                        for (int i = 0; i < this.availableReceivers.size(); i++) {
-                            TReceiver receiver = this.availableReceivers.get(i);
-                            WeightedTaskLoadBalancer.TReceiver.TConnection connection = null;
-                            try {
-
-                                connection =
-                                        EnumerableExt
-                                                .firstOrDefault(
-                                                        receiver.getOpenConnections(),
-                                                        new IFunction1<Boolean, WeightedTaskLoadBalancer.TReceiver.TConnection>() {
-                                                            public
-                                                                    Boolean
-                                                                    invoke(WeightedTaskLoadBalancer.TReceiver.TConnection x) {
-                                                                return Boolean.valueOf(x
-                                                                        .getResponseReceiverId().equals(
-                                                                                e.getResponseReceiverId()));
-                                                            }
-                                                        });
-                            } catch (Exception exception) {
-                                EneterTrace.error(TracedObject()
-                                        + " failed during EnumberableExt.firstOrDefault()", exception);
-                            }
-
-                            if (connection == null) {
-                                try {
-                                    IDuplexOutputChannel outputChannel =
-                                            this.messagingSystemFactory.createDuplexOutputChannel(receiver
-                                                    .getChannelId());
-                                    connection =
-                                            new WeightedTaskLoadBalancer.TReceiver.TConnection(
-                                                    e.getResponseReceiverId(), outputChannel);
-                                    connection.getDuplexOutputChannel().responseMessageReceived()
-                                            .subscribe(this.onResponseMessageReceivedHandler);
-                                    connection.getDuplexOutputChannel().openConnection();
-
-                                    receiver.getOpenConnections().add(connection);
-                                } catch (Exception exception) {
-                                    connection.getDuplexOutputChannel().responseMessageReceived()
-                                            .unsubscribe(onResponseMessageReceivedHandler);
-                                    EneterTrace.warning(
-                                            TracedObject() + " failed to open connection to receiver "
-                                                    + receiver.getChannelId(), exception);
-                                }
-                            }
-
-                            try {
-                                connection.getDuplexOutputChannel().sendMessage(e.getMessage());
-                            } catch (Exception exception) {
-                                EneterTrace
-                                        .warning(TracedObject() + " failed to send the message", exception);
-
-                                try {
-                                    connection.getDuplexOutputChannel().closeConnection();
-                                } catch (Exception exception2) {
-                                    EneterTrace.warning(TracedObject()
-                                            + " failed to send the message that the connection was closed."
-                                            + exception2);
-                                }
-
-                                connection.getDuplexOutputChannel().responseMessageReceived()
-                                        .unsubscribe(onResponseMessageReceivedHandler);
-                                receiver.getOpenConnections().remove(connection);
-
-                                continue;
-                            }
-
-                            availableReceivers.remove(i);
-
-                            receiver.decreaseFreeQuota();
-                            if (receiver.getFreeQuota() > 0) {
-                                // round-robin technique : remove the current receiver
-                                // from the list and add it to the end of the list.
-                                availableReceivers.add(receiver);
-                            }else if (availableReceivers.size() == 0){
-                                // if all the receiver capacities have been completely exhausted
-                                // then reset the list of available receivers.
-                                for (TReceiver aReceiver : receivers){
-                                    aReceiver.resetFreeQuota();
-                                    availableReceivers.add(aReceiver);
-                                }
-                            }
-                            
-                            break;
-                        }
-                    }
+                    return;
                 }
 
             }
+            synchronized (availableReceivers) {
+                for (int i = 0; i < this.availableReceivers.size(); i++) {
+                    TReceiver receiver = this.availableReceivers.get(i);
+                    WeightedTaskLoadBalancer.TReceiver.TConnection connection = null;
+                    try {
+
+                        connection =
+                                EnumerableExt
+                                        .firstOrDefault(
+                                                receiver.getOpenConnections(),
+                                                new IFunction1<Boolean, WeightedTaskLoadBalancer.TReceiver.TConnection>() {
+                                                    public Boolean invoke(
+                                                            WeightedTaskLoadBalancer.TReceiver.TConnection x) {
+                                                        return Boolean.valueOf(x.getResponseReceiverId()
+                                                                .equals(e.getResponseReceiverId()));
+                                                    }
+                                                });
+                    } catch (Exception exception) {
+                        EneterTrace.error(TracedObject() + " failed during EnumberableExt.firstOrDefault()",
+                                exception);
+                    }
+
+                    if (connection == null) {
+                        try {
+                            IDuplexOutputChannel outputChannel =
+                                    this.messagingSystemFactory.createDuplexOutputChannel(receiver
+                                            .getChannelId());
+                            connection =
+                                    new WeightedTaskLoadBalancer.TReceiver.TConnection(
+                                            e.getResponseReceiverId(), outputChannel);
+                            connection.getDuplexOutputChannel().responseMessageReceived()
+                                    .subscribe(this.onResponseMessageReceivedHandler);
+                            connection.getDuplexOutputChannel().openConnection();
+
+                            receiver.getOpenConnections().add(connection);
+                        } catch (Exception exception) {
+                            connection.getDuplexOutputChannel().responseMessageReceived()
+                                    .unsubscribe(onResponseMessageReceivedHandler);
+                            EneterTrace.warning(TracedObject() + " failed to open connection to receiver "
+                                    + receiver.getChannelId(), exception);
+                        }
+                    }
+
+                    try {
+                        connection.getDuplexOutputChannel().sendMessage(e.getMessage());
+                    } catch (Exception exception) {
+                        EneterTrace.warning(TracedObject() + " failed to send the message", exception);
+
+                        try {
+                            connection.getDuplexOutputChannel().closeConnection();
+                        } catch (Exception exception2) {
+                            EneterTrace.warning(TracedObject()
+                                    + " failed to send the message that the connection was closed."
+                                    + exception2);
+                        }
+
+                        connection.getDuplexOutputChannel().responseMessageReceived()
+                                .unsubscribe(onResponseMessageReceivedHandler);
+                        receiver.getOpenConnections().remove(connection);
+
+                        continue;
+                    }
+
+                    availableReceivers.remove(i);
+
+                    receiver.decreaseFreeQuota();
+                    if (receiver.getFreeQuota() > 0) {
+                        // round-robin technique : remove the current receiver
+                        // from the list and add it to the end of the list.
+                        availableReceivers.add(receiver);
+                    } else if (availableReceivers.size() == 0) {
+                        // if all the receiver capacities have been completely exhausted
+                        // then reset the list of available receivers.
+                        synchronized (receivers) {
+                            for (TReceiver aReceiver : receivers) {
+                                aReceiver.resetFreeQuota();
+                                availableReceivers.add(aReceiver);
+                            }
+                        }
+                    }
+
+                    break;
+                }
+            }
+
         } finally {
             EneterTrace.leaving(trace);
         }
