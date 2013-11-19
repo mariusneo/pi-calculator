@@ -6,6 +6,7 @@
 
 package com.loadbalancing.loadbalancer;
 
+import java.net.ConnectException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -291,10 +292,20 @@ public class WeightedTaskLoadBalancer extends AttachableDuplexInputChannelBase i
 
                             receiver.getOpenConnections().add(connection);
                         } catch (Exception exception) {
-                            connection.getDuplexOutputChannel().responseMessageReceived()
-                                    .unsubscribe(onResponseMessageReceivedHandler);
                             EneterTrace.warning(TracedObject() + " failed to open connection to receiver "
                                     + receiver.getChannelId(), exception);
+                            connection.getDuplexOutputChannel().responseMessageReceived()
+                                    .unsubscribe(onResponseMessageReceivedHandler);
+
+                            try {
+                                this.removeDuplexOutputChannel(receiver.getChannelId());
+                            } catch (Exception removeException) {
+                                EneterTrace.warning(
+                                        TracedObject() + " failed to remove duplex output channel "
+                                                + receiver.getChannelId(), removeException);
+                            }
+
+                            continue;
                         }
                     }
 
@@ -303,17 +314,26 @@ public class WeightedTaskLoadBalancer extends AttachableDuplexInputChannelBase i
                     } catch (Exception exception) {
                         EneterTrace.warning(TracedObject() + " failed to send the message", exception);
 
-                        try {
-                            connection.getDuplexOutputChannel().closeConnection();
-                        } catch (Exception exception2) {
-                            EneterTrace.warning(TracedObject()
-                                    + " failed to send the message that the connection was closed."
-                                    + exception2);
+                        if (exception instanceof ConnectException) {
+                            try {
+                                this.removeDuplexOutputChannel(receiver.getChannelId());
+                            } catch (Exception removeException) {
+                                EneterTrace.warning(
+                                        TracedObject() + " failed to remove duplex output channel "
+                                                + receiver.getChannelId(), removeException);
+                            }
+                        } else {
+                            try {
+                                connection.getDuplexOutputChannel().closeConnection();
+                            } catch (Exception exception2) {
+                                EneterTrace.warning(TracedObject()
+                                        + " failed to send the message that the connection was closed."
+                                        + exception2);
+                            }
+                            connection.getDuplexOutputChannel().responseMessageReceived()
+                                    .unsubscribe(onResponseMessageReceivedHandler);
+                            receiver.getOpenConnections().remove(connection);
                         }
-
-                        connection.getDuplexOutputChannel().responseMessageReceived()
-                                .unsubscribe(onResponseMessageReceivedHandler);
-                        receiver.getOpenConnections().remove(connection);
 
                         continue;
                     }

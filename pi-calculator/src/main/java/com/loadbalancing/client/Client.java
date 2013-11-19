@@ -34,7 +34,6 @@ public class Client {
                 messagingFactory.createDuplexOutputChannel("tcp://127.0.0.1:8060");
 
         // Create sender to send requests
-        ISerializer serializer = null;
         IDuplexTypedMessagesFactory senderFactory = new DuplexTypedMessagesFactory();
 
         IDuplexTypedMessageSender<Double, Range> sender =
@@ -70,6 +69,12 @@ public class Client {
             Range anInterval = new Range(i, i + 0.005);
 
             System.out.println("Sending interval from : " + anInterval.getFrom() + " to: " + anInterval.getTo());
+            try {
+                // simulate a network delay
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
             sender.sendRequestMessage(anInterval);
         }
     }

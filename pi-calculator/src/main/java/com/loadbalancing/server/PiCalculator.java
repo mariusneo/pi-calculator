@@ -9,13 +9,18 @@ package com.loadbalancing.server;
 import java.util.Scanner;
 
 import com.loadbalancing.model.Range;
+import com.loadbalancing.model.WeightedServiceRegistration;
 
 import eneter.messaging.endpoints.typedmessages.DuplexTypedMessagesFactory;
 import eneter.messaging.endpoints.typedmessages.IDuplexTypedMessageReceiver;
 import eneter.messaging.endpoints.typedmessages.IDuplexTypedMessagesFactory;
+import eneter.messaging.endpoints.typedmessages.ITypedMessageSender;
+import eneter.messaging.endpoints.typedmessages.ITypedMessagesFactory;
+import eneter.messaging.endpoints.typedmessages.TypedMessagesFactory;
 import eneter.messaging.endpoints.typedmessages.TypedRequestReceivedEventArgs;
 import eneter.messaging.messagingsystems.messagingsystembase.IDuplexInputChannel;
 import eneter.messaging.messagingsystems.messagingsystembase.IMessagingSystemFactory;
+import eneter.messaging.messagingsystems.messagingsystembase.IOutputChannel;
 import eneter.messaging.messagingsystems.tcpmessagingsystem.TcpMessagingSystemFactory;
 import eneter.net.system.EventHandler;
 
@@ -31,15 +36,28 @@ import eneter.net.system.EventHandler;
  */
 public class PiCalculator {
     public static void main(String[] args) throws Exception {
-        if (args.length != 1) {
-            System.out.println("Usage: PiCalculator port");
+        if (args.length != 2) {
+            System.out.println("Usage: PiCalculator port weight");
         }
 
         String serverAddress = "tcp://127.0.0.1:" + args[0];
+        int weight = Integer.parseInt(args[1]);
 
-        // Create TCP messaging for receiving requests.
+        // Create TCP messaging for sending and receiving requests.
         IMessagingSystemFactory messagingFactory = new TcpMessagingSystemFactory();
-        IDuplexInputChannel inputChannel = messagingFactory.createDuplexInputChannel(serverAddress);
+
+        String loadBalancerAddress = "tcp://127.0.0.1:8061";
+        // Register the service to the load balancer
+        IOutputChannel serviceRegistrationOutputChannel =
+                messagingFactory.createOutputChannel(loadBalancerAddress);
+        ITypedMessagesFactory senderFactory = new TypedMessagesFactory();
+
+        ITypedMessageSender<WeightedServiceRegistration> sender =
+                senderFactory.createTypedMessageSender(WeightedServiceRegistration.class);
+
+        sender.attachOutputChannel(serviceRegistrationOutputChannel);
+        sender.sendMessage(new WeightedServiceRegistration(serverAddress, weight));
+        sender.detachOutputChannel();
 
         // Create typed message receiver to receive requests.
         // It receives request messages of type Range and sends back
@@ -74,6 +92,7 @@ public class PiCalculator {
             }
         });
 
+        IDuplexInputChannel inputChannel = messagingFactory.createDuplexInputChannel(serverAddress);
         receiver.attachDuplexInputChannel(inputChannel);
 
         System.out.println("Root Square Calculator listening to " + serverAddress
